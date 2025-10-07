@@ -97,23 +97,41 @@ class ClearOneClient:
 # MQTT callbacks
 def on_connect(client, userdata, flags, rc):
     print(f"[MQTT] Connected with result code {rc}")
-    # Subscribe to all ClearOne set commands
+    # Subscribe to all ClearOne set commands with group
     client.subscribe("clearone/+/+/+/+/set")
+    # Subscribe to ClearOne set commands without group
+    client.subscribe("clearone/+/+/+/set")
+
 
 def on_message(client, userdata, msg):
     topic_parts = msg.topic.split('/')
-    if len(topic_parts) != 6 or topic_parts[0] != 'clearone' or topic_parts[5] != 'set':
+
+    # Check basic structure and that it starts with 'clearone' and ends with 'set'
+    if topic_parts[0] != 'clearone' or topic_parts[-1] != 'set':
         return
 
     dev = topic_parts[1]
     command = topic_parts[2].upper()
-    group = topic_parts[3].upper()
-    channel = topic_parts[4].upper()
     value = msg.payload.decode('utf-8').strip()
 
-    # Form ClearOne command: #<dev> <command> <channel> <group> <value>
-    clearone_cmd = f"#{dev} {command} {channel} {group} {value}"
+    # Determine if topic has a group or not
+    if len(topic_parts) == 6:
+        # Format: clearone/{DEV}/{COMMAND}/{GROUP}/{CHANNEL}/set
+        channel = topic_parts[3].upper()
+        group = topic_parts[4].upper()
+        clearone_cmd = f"#{dev} {command} {channel} {group} {value}"
+    elif len(topic_parts) == 5:
+        # Format: clearone/{DEV}/{COMMAND}/{CHANNEL}/set
+        group = None
+        channel = topic_parts[3].upper()
+        clearone_cmd = f"#{dev} {command} {channel} {value}"
+    else:
+        # Invalid topic format
+        return
+
+    # Put command in queue
     cmd_queue.put(clearone_cmd)
+
 
 # Thread to process outgoing commands
 def process_commands(clearone):
@@ -139,19 +157,26 @@ def listen_clearone(clearone, mqtt_client):
                 line = line.strip()
                 if not line or not line.startswith('#'):
                     continue
-                # Parse command line: #<dev> <command> <channel> <group> <value>
+                # Parse command line
                 parts = line.split()
-                if len(parts) < 5:
-                    continue
+                if len(parts) < 4:
+                    continue  # Not enough parts to parse
                 dev = parts[0][1:]  # Remove #
                 command = parts[1].upper()
                 channel = parts[2].upper()
-                group = parts[3].upper()
-                value = parts[4]
-                topic = f"clearone/{dev}/{command}/{group}/{channel}/state"
+                if len(parts) >= 5:
+                    group = parts[3].upper()
+                    value = parts[4]
+                    topic = f"clearone/{dev}/{command}/{channel}/{group}/state"
+                else:
+                    group = None
+                    value = parts[3]
+                    topic = f"clearone/{dev}/{command}/{channel}/state"
+
                 mqtt_client.publish(topic, value)
                 if clearone.verbose:
                     print(f"[MQTT] Published {topic} = {value}")
+
         
 
 def main():
