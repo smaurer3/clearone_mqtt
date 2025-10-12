@@ -178,6 +178,19 @@ def listen_clearone(clearone, mqtt_client):
                     print(f"[MQTT] Published {topic} = {value}")
 
         
+# Thread to keep the ClearOne telnet session alive
+def clearone_keepalive(clearone):
+    while True:
+        time.sleep(60)
+        if not clearone.connected:
+            continue
+        try:
+            clearone.send_command("#** VER")
+            if clearone.verbose:
+                print("[ClearOne] Keepalive sent (#** VER)")
+        except Exception as e:
+            clearone.log(f"Keepalive failed: {e}")
+            clearone.connected = False
 
 def main():
     parser = argparse.ArgumentParser(description="Bidirectional ClearOne ↔ MQTT bridge")
@@ -204,6 +217,8 @@ def main():
 
     threading.Thread(target=process_commands, args=(clearone,), daemon=True).start()
     threading.Thread(target=listen_clearone, args=(clearone, mqtt_client), daemon=True).start()
+    threading.Thread(target=clearone_keepalive, args=(clearone,), daemon=True).start()
+
 
     print("Bridge running. Press Ctrl+C to exit.")
     try:
