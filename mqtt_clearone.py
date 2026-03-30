@@ -19,6 +19,7 @@ class ClearOneClient:
         self.verbose = verbose
         self.sock = None
         self.connected = False
+        self.send_lock = threading.Lock()
 
     def log(self, msg):
         if self.verbose:
@@ -63,13 +64,13 @@ class ClearOneClient:
             return False
 
     def send_command(self, cmd):
-        
         if not self.connected:
             self.log("Not connected, cannot send command")
             return
         try:
             full_cmd = cmd.strip() + "\r"
-            self.sock.send(full_cmd.encode())
+            with self.send_lock:
+                self.sock.send(full_cmd.encode())
             self.log(f"Sent: {full_cmd.strip()}")
         except Exception as e:
             self.log(f"Send failed: {e}")
@@ -142,7 +143,7 @@ def process_commands(clearone):
             clearone.connect()
         if clearone.connected:
             clearone.send_command(cmd)
-        time.sleep(0.05)  # Slight delay to avoid overwhelming the device
+        time.sleep(0.1)  # Slight delay to avoid overwhelming the device
 
 # Thread to listen for ClearOne responses
 def listen_clearone(clearone, mqtt_client):
