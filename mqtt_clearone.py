@@ -9,6 +9,8 @@ import paho.mqtt.client as mqtt
 
 # Global queue for commands to ClearOne
 cmd_queue = queue.Queue()
+# Track last known gate values to only publish on change
+gate_state_cache = {}
 
 class ClearOneClient:
     def __init__(self, host, user, password, verbose=False):
@@ -20,12 +22,15 @@ class ClearOneClient:
         self.sock = None
         self.connected = False
         self.send_lock = threading.Lock()
+        self.greport_units = None
 
     def log(self, msg):
         if self.verbose:
             print(f"[ClearOne] {msg}")
 
-    def connect(self):
+    def connect(self, greport_units=None):
+        if greport_units is not None:
+            self.greport_units = greport_units
         try:
             self.sock = socket.socket()
             self.sock.settimeout(5)
@@ -55,6 +60,13 @@ class ClearOneClient:
                 resp = self.sock.recv(512)
                 if b'Authenticated' in resp:
                     self.log("Authenticated")
+                    time.sleep(0.5)
+                    if self.greport_units:
+                        for unit in self.greport_units:
+                            cmd = f"#{unit} GREPORT 1\r"
+                            self.sock.send(cmd.encode())
+                            self.log(f"GREPORT enabled for unit {unit}")
+                            time.sleep(0.1)
                     return True
                 if b'Invalid' in resp:
                     self.log("Invalid credentials")
@@ -77,7 +89,6 @@ class ClearOneClient:
             self.connected = False
 
     def recv_data(self):
-        
         try:
             data = self.sock.recv(512).decode('utf-8')
             return data
@@ -94,6 +105,7 @@ class ClearOneClient:
         except:
             pass
         self.connected = False
+
 
 # MQTT callbacks
 def on_connect(client, userdata, flags, rc):
@@ -136,7 +148,6 @@ def on_message(client, userdata, msg):
 
 # Thread to process outgoing commands
 def process_commands(clearone):
-    
     while True:
         cmd = cmd_queue.get()
         if not clearone.connected:
@@ -145,24 +156,52 @@ def process_commands(clearone):
             clearone.send_command(cmd)
         time.sleep(0.1)  # Slight delay to avoid overwhelming the device
 
+
 # Thread to listen for ClearOne responses
 def listen_clearone(clearone, mqtt_client):
     while True:
         if not clearone.connected:
-            time.sleep(1)
-            continue
+            clearone.log("Disconnected, attempting reconnect...")
+            if clearone.connect():
+                clearone.log("Reconnected successfully")
+            else:
+                time.sleep(5)
+                continue
         data = clearone.recv_data()
         if data:
+            if clearone.verbose:
+                print(f"[CLEARONE] Received = {data}")
             lines = re.split(r'\r|\n', data)
             for line in lines:
                 line = line.strip()
                 if not line or not line.startswith('#'):
                     continue
-                # Parse command line
                 parts = line.split()
+
+                # Handle GATE specially - format is #DEV GATE HEXVALUE
+                # Parse bitmap and publish individual per-mic topics as 1 or 0
+                if len(parts) == 3 and parts[1].upper() == 'GATE':
+                    dev = parts[0][1:]
+                    gate_hex = parts[2]
+                    try:
+                        gate_val = int(gate_hex, 16)
+                        for mic in range(1, 9):
+                            bit = (gate_val >> (mic - 1)) & 1
+                            cache_key = f"{dev}/GATE/{mic}"
+                            if gate_state_cache.get(cache_key) != bit:
+                                gate_state_cache[cache_key] = bit
+                                topic = f"clearone/{dev}/GATE/{mic}"
+                                mqtt_client.publish(topic, str(bit))
+                                if clearone.verbose:
+                                    print(f"[MQTT] Published {topic} = {bit}")
+                    except ValueError:
+                        clearone.log(f"Could not parse GATE value: {gate_hex}")
+                    continue
+
+                # Original logic for everything else
                 if len(parts) < 4:
-                    continue  # Not enough parts to parse
-                dev = parts[0][1:]  # Remove #
+                    continue
+                dev = parts[0][1:]
                 command = parts[1].upper()
                 channel = parts[2].upper()
                 if len(parts) >= 5:
@@ -178,7 +217,7 @@ def listen_clearone(clearone, mqtt_client):
                 if clearone.verbose:
                     print(f"[MQTT] Published {topic} = {value}")
 
-        
+
 # Thread to keep the ClearOne telnet session alive
 def clearone_keepalive(clearone):
     while True:
@@ -193,8 +232,9 @@ def clearone_keepalive(clearone):
             clearone.log(f"Keepalive failed: {e}")
             clearone.connected = False
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Bidirectional ClearOne ↔ MQTT bridge")
+    parser = argparse.ArgumentParser(description="Bidirectional ClearOne <-> MQTT bridge")
     parser.add_argument("--clearone-host", required=True, help="ClearOne IP/hostname")
     parser.add_argument("--clearone-user", required=True, help="ClearOne username")
     parser.add_argument("--clearone-pass", required=True, help="ClearOne password")
@@ -202,11 +242,14 @@ def main():
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port")
     parser.add_argument("--mqtt-user", help="MQTT username")
     parser.add_argument("--mqtt-pass", help="MQTT password")
+    parser.add_argument("-g", "--greport", action="append", dest="greport_units",
+                        metavar="UNIT_ID",
+                        help="Enable GREPORT for unit ID (optional, can be specified multiple times e.g. -g 10 -g H2)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
 
     clearone = ClearOneClient(args.clearone_host, args.clearone_user, args.clearone_pass, verbose=args.verbose)
-    clearone.connect()
+    clearone.connect(greport_units=args.greport_units)
 
     mqtt_client = mqtt.Client()
     if args.mqtt_user:
@@ -220,8 +263,8 @@ def main():
     threading.Thread(target=listen_clearone, args=(clearone, mqtt_client), daemon=True).start()
     threading.Thread(target=clearone_keepalive, args=(clearone,), daemon=True).start()
 
-
     print("Bridge running. Press Ctrl+C to exit.")
+    print(f"GREPORT enabled for units: {args.greport_units or 'none'}")
     try:
         while True:
             time.sleep(1)
@@ -230,6 +273,7 @@ def main():
         clearone.close()
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
+
 
 if __name__ == "__main__":
     main()
