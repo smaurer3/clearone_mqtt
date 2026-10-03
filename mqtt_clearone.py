@@ -9,8 +9,15 @@ import paho.mqtt.client as mqtt
 
 # Global queue for commands to ClearOne
 cmd_queue = queue.Queue()
+
+# Global ClearOne client instance (needed for refresh handler)
+clearone_instance = None
+
 # Track last known gate values to only publish on change
 gate_state_cache = {}
+
+# Force refresh flag — bypasses cache on next gate report
+force_gate_refresh = False
 
 class ClearOneClient:
     def __init__(self, host, user, password, verbose=False):
@@ -22,6 +29,7 @@ class ClearOneClient:
         self.sock = None
         self.connected = False
         self.send_lock = threading.Lock()
+        self._connect_lock = threading.Lock()
         self.greport_units = None
 
     def log(self, msg):
@@ -29,19 +37,33 @@ class ClearOneClient:
             print(f"[ClearOne] {msg}")
 
     def connect(self, greport_units=None):
-        if greport_units is not None:
-            self.greport_units = greport_units
-        try:
-            self.sock = socket.socket()
-            self.sock.settimeout(5)
-            self.sock.connect((self.host, self.telnet_port))
-            self.connected = True
-            self.log("Telnet connected")
-            return self.authenticate()
-        except Exception as e:
-            self.log(f"Connection failed: {e}")
-            self.connected = False
+        if not self._connect_lock.acquire(blocking=False):
+            self.log("Connect already in progress, skipping")
             return False
+        try:
+            if greport_units is not None:
+                self.greport_units = greport_units
+            # Close any existing socket cleanly before reconnecting
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+            self.connected = False
+            try:
+                self.sock = socket.socket()
+                self.sock.settimeout(5)
+                self.sock.connect((self.host, self.telnet_port))
+                self.connected = True
+                self.log("Telnet connected")
+                return self.authenticate()
+            except Exception as e:
+                self.log(f"Connection failed: {e}")
+                self.connected = False
+                return False
+        finally:
+            self._connect_lock.release()
 
     def authenticate(self):
         try:
@@ -60,13 +82,18 @@ class ClearOneClient:
                 resp = self.sock.recv(512)
                 if b'Authenticated' in resp:
                     self.log("Authenticated")
-                    time.sleep(0.5)
+                    time.sleep(1)
+                    self.sock.send(("\r").encode())
+                    time.sleep(.5)
                     if self.greport_units:
                         for unit in self.greport_units:
                             cmd = f"#{unit} GREPORT 1\r"
                             self.sock.send(cmd.encode())
                             self.log(f"GREPORT enabled for unit {unit}")
                             time.sleep(0.1)
+                    # Query initial gate status for all units
+                    time.sleep(0.5)
+                    self._query_all_gates()
                     return True
                 if b'Invalid' in resp:
                     self.log("Invalid credentials")
@@ -74,6 +101,23 @@ class ClearOneClient:
         except Exception as e:
             self.log(f"Authentication error: {e}")
             return False
+
+    def _query_all_gates(self):
+        """Query current gate status from all configured units"""
+        global force_gate_refresh
+        force_gate_refresh = True
+        if self.greport_units:
+            for unit in self.greport_units:
+                self.send_command(f"#{unit} GATE")
+                time.sleep(0.1)
+        else:
+            self.send_command("#** GATE")
+        # Reset force flag after 2 seconds
+        threading.Timer(2.0, self._clear_force_refresh).start()
+
+    def _clear_force_refresh(self):
+        global force_gate_refresh
+        force_gate_refresh = False
 
     def send_command(self, cmd):
         if not self.connected:
@@ -90,8 +134,12 @@ class ClearOneClient:
 
     def recv_data(self):
         try:
-            data = self.sock.recv(512).decode('utf-8')
-            return data
+            raw = self.sock.recv(512)
+            if not raw:   # EOF — remote closed connection cleanly (e.g. powered off)
+                self.log("Connection closed by remote (EOF)")
+                self.connected = False
+                return ""
+            return raw.decode('utf-8')
         except socket.timeout:
             return ""
         except Exception as e:
@@ -114,10 +162,32 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe("clearone/+/+/+/+/set")
     # Subscribe to ClearOne set commands without group
     client.subscribe("clearone/+/+/+/set")
+    # Subscribe to refresh command
+    client.subscribe("clearone/refresh")
+    # Subscribe to device discovery command
+    client.subscribe("clearone/discover")
 
 
 def on_message(client, userdata, msg):
-    topic_parts = msg.topic.split('/')
+    global force_gate_refresh
+    topic = msg.topic
+    payload = msg.payload.decode('utf-8').strip()
+
+    # Handle refresh command — clears cache and re-queries all gate statuses
+    if topic == "clearone/refresh":
+        if clearone_instance and clearone_instance.connected:
+            print("[ClearOne] Refresh requested — querying gate status")
+            clearone_instance._query_all_gates()
+        return
+
+    # Handle device discovery — sends #** DID to all units
+    if topic == "clearone/discover":
+        if clearone_instance and clearone_instance.connected:
+            print("[ClearOne] Device discovery requested — sending #** DID")
+            cmd_queue.put("#** DID")
+        return
+
+    topic_parts = topic.split('/')
 
     # Check basic structure and that it starts with 'clearone' and ends with 'set'
     if topic_parts[0] != 'clearone' or topic_parts[-1] != 'set':
@@ -125,11 +195,11 @@ def on_message(client, userdata, msg):
 
     dev = topic_parts[1]
     command = topic_parts[2].upper()
-    value = msg.payload.decode('utf-8').strip()
+    value = payload
 
     # Determine if topic has a group or not
     if len(topic_parts) == 6:
-        # Format: clearone/{DEV}/{COMMAND}/{GROUP}/{CHANNEL}/set
+        # Format: clearone/{DEV}/{COMMAND}/{CHANNEL}/{GROUP}/set
         channel = topic_parts[3].upper()
         group = topic_parts[4].upper()
         clearone_cmd = f"#{dev} {command} {channel} {group} {value}"
@@ -147,13 +217,14 @@ def on_message(client, userdata, msg):
 
 
 # Thread to process outgoing commands
+# Does NOT attempt reconnect — listen_clearone is the sole reconnect manager
 def process_commands(clearone):
     while True:
         cmd = cmd_queue.get()
-        if not clearone.connected:
-            clearone.connect()
         if clearone.connected:
             clearone.send_command(cmd)
+        else:
+            clearone.log(f"Not connected, dropping command: {cmd}")
         time.sleep(0.1)  # Slight delay to avoid overwhelming the device
 
 
@@ -188,7 +259,7 @@ def listen_clearone(clearone, mqtt_client):
                         for mic in range(1, 9):
                             bit = (gate_val >> (mic - 1)) & 1
                             cache_key = f"{dev}/GATE/{mic}"
-                            if gate_state_cache.get(cache_key) != bit:
+                            if force_gate_refresh or gate_state_cache.get(cache_key) != bit:
                                 gate_state_cache[cache_key] = bit
                                 topic = f"clearone/{dev}/GATE/{mic}"
                                 mqtt_client.publish(topic, str(bit))
@@ -196,6 +267,16 @@ def listen_clearone(clearone, mqtt_client):
                                     print(f"[MQTT] Published {topic} = {bit}")
                     except ValueError:
                         clearone.log(f"Could not parse GATE value: {gate_hex}")
+                    continue
+
+                # Handle DID response: #DEV DID DEVID  (3 parts)
+                if len(parts) == 3 and parts[1].upper() == 'DID':
+                    dev = parts[0][1:]
+                    did_val = parts[2]
+                    topic = f"clearone/{dev}/DID/state"
+                    mqtt_client.publish(topic, did_val)
+                    if clearone.verbose:
+                        print(f"[MQTT] Published {topic} = {did_val}")
                     continue
 
                 # Original logic for everything else
@@ -234,6 +315,8 @@ def clearone_keepalive(clearone):
 
 
 def main():
+    global clearone_instance
+
     parser = argparse.ArgumentParser(description="Bidirectional ClearOne <-> MQTT bridge")
     parser.add_argument("--clearone-host", required=True, help="ClearOne IP/hostname")
     parser.add_argument("--clearone-user", required=True, help="ClearOne username")
@@ -248,10 +331,15 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
 
-    clearone = ClearOneClient(args.clearone_host, args.clearone_user, args.clearone_pass, verbose=args.verbose)
-    clearone.connect(greport_units=args.greport_units)
+    clearone_instance = ClearOneClient(
+        args.clearone_host, args.clearone_user, args.clearone_pass, verbose=args.verbose
+    )
+    clearone_instance.connect(greport_units=args.greport_units)
 
-    mqtt_client = mqtt.Client()
+    try:
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+    except AttributeError:
+        mqtt_client = mqtt.Client()
     if args.mqtt_user:
         mqtt_client.username_pw_set(args.mqtt_user, args.mqtt_pass)
     mqtt_client.on_connect = on_connect
@@ -259,18 +347,19 @@ def main():
     mqtt_client.connect(args.mqtt_host, args.mqtt_port, 60)
     mqtt_client.loop_start()
 
-    threading.Thread(target=process_commands, args=(clearone,), daemon=True).start()
-    threading.Thread(target=listen_clearone, args=(clearone, mqtt_client), daemon=True).start()
-    threading.Thread(target=clearone_keepalive, args=(clearone,), daemon=True).start()
+    threading.Thread(target=process_commands, args=(clearone_instance,), daemon=True).start()
+    threading.Thread(target=listen_clearone, args=(clearone_instance, mqtt_client), daemon=True).start()
+    threading.Thread(target=clearone_keepalive, args=(clearone_instance,), daemon=True).start()
 
     print("Bridge running. Press Ctrl+C to exit.")
     print(f"GREPORT enabled for units: {args.greport_units or 'none'}")
+    print(f"Publish to 'clearone/refresh' to force gate status refresh")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("Shutting down...")
-        clearone.close()
+        clearone_instance.close()
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
 
